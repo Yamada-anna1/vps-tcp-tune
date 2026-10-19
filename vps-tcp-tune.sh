@@ -3,7 +3,7 @@
 # Only manage the TCP autotuning send-buffer ceiling. No kernel/service changes.
 set -Eeuo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 KEY=net.ipv4.tcp_wmem
 TARGET_MAX=33554432
 CONFIG_FILE=/etc/sysctl.d/99-vps-tcp-throughput.conf
@@ -115,6 +115,7 @@ check_target_file() {
 }
 
 validate_state() {
+    local STATE_DIR=${1:-$STATE_DIR}
     local f phase original applied original_file
     [[ -d $STATE_DIR && ! -L $STATE_DIR && -O $STATE_DIR ]] || die "Unsafe state directory: $STATE_DIR"
     for f in original-value applied-value original-file managed.conf phase; do
@@ -134,19 +135,20 @@ validate_state() {
 }
 
 install_file() {
-    local source=$1 preserve=$2
-    TEMP_FILE=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX") || return 1
+    local source=$1 preserve=$2 destination=${3:-$CONFIG_FILE}
+    TEMP_FILE=$(mktemp "${destination}.tmp.XXXXXX") || return 1
     if [[ $preserve == yes ]]; then
         cp -p -- "$source" "$TEMP_FILE" || return 1
     else
         cp -- "$source" "$TEMP_FILE" || return 1
         chmod 644 "$TEMP_FILE" || return 1
     fi
-    mv -f -- "$TEMP_FILE" "$CONFIG_FILE" || return 1
+    mv -f -- "$TEMP_FILE" "$destination" || return 1
     TEMP_FILE=
 }
 
 original_file_matches() {
+    local STATE_DIR=${1:-$STATE_DIR}
     if [[ $(<"$STATE_DIR/original-file") == present ]]; then
         [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE ]] && cmp -s -- "$CONFIG_FILE" "$STATE_DIR/original.conf"
     else
@@ -155,6 +157,7 @@ original_file_matches() {
 }
 
 restore_snapshot() {
+    local STATE_DIR=${1:-$STATE_DIR}
     local original failed=0
     original=$(<"$STATE_DIR/original-value")
     if [[ $(<"$STATE_DIR/original-file") == present ]]; then
@@ -178,6 +181,59 @@ archive_state() {
     info "Backup retained: $archive"
 }
 
+archive_update() {
+    local archive
+    archive="${STATE_DIR}.upgrade-$1-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    [[ ! -e $archive && ! -L $archive ]] || return 1
+    mv -- "$STATE_DIR/update" "$archive" || return 1
+    info "Update snapshot retained: $archive"
+}
+
+recover_update() {
+    local journal=$STATE_DIR/update current previous next
+    [[ -e $journal || -L $journal ]] || return 0
+    [[ -d $STATE_DIR && ! -L $STATE_DIR && -O $STATE_DIR ]] || return 1
+    validate_state "$journal"
+    [[ $(<"$journal/original-file") == present ]] || return 1
+    current=$(read_value) || return 1
+    previous=$(<"$journal/original-value")
+    next=$(<"$journal/applied-value")
+    [[ $current == "$previous" || $current == "$next" ]] || return 1
+    if ! original_file_matches "$journal"; then
+        [[ ! -L $CONFIG_FILE && -f $CONFIG_FILE ]] || return 1
+        cmp -s -- "$CONFIG_FILE" "$journal/managed.conf" || return 1
+    fi
+    # Only these two records change during an update. The first installation's
+    # original-value/original.conf remain untouched for a later full rollback.
+    restore_snapshot "$journal" || return 1
+    install_file "$journal/original-value" yes "$STATE_DIR/applied-value" || return 1
+    install_file "$journal/original.conf" yes "$STATE_DIR/managed.conf" || return 1
+    archive_update recovered || return 1
+    info "Recovered the previous applied value: $previous"
+}
+
+upgrade_tuning() {
+    local current=$1 desired=$2
+    PREP_DIR=$(mktemp -d "${STATE_DIR}.prepare.XXXXXX")
+    printf '%s\n' "$current" > "$PREP_DIR/original-value"
+    printf '%s\n' "$desired" > "$PREP_DIR/applied-value"
+    cp -p -- "$CONFIG_FILE" "$PREP_DIR/original.conf"
+    printf 'present\n' > "$PREP_DIR/original-file"
+    printf '# Managed by vps-tcp-tune %s; use the rollback command to restore.\n%s = %s\n' "$VERSION" "$KEY" "$desired" > "$PREP_DIR/managed.conf"
+    printf 'prepared\n' > "$PREP_DIR/phase"
+    mv -- "$PREP_DIR" "$STATE_DIR/update"
+    PREP_DIR=
+    TX_ACTIVE=2
+    install_file "$STATE_DIR/update/managed.conf" no
+    set_value "$desired" || die 'sysctl write or read-back failed during update.'
+    install_file "$STATE_DIR/update/applied-value" yes "$STATE_DIR/applied-value"
+    install_file "$STATE_DIR/update/managed.conf" yes "$STATE_DIR/managed.conf"
+    archive_update committed
+    TX_ACTIVE=0
+    info "Updated: $KEY = $desired (first installation backup preserved)."
+    info 'No reboot or proxy restart is needed.'
+}
+
 on_exit() {
     local code=$?
     trap - EXIT
@@ -186,7 +242,11 @@ on_exit() {
         rm -f -- "$TEMP_FILE"
         TEMP_FILE=
     fi
-    if (( TX_ACTIVE )); then
+    if (( TX_ACTIVE == 2 )); then
+        printf 'Update did not finish; restoring the previous applied configuration...\n' >&2
+        recover_update || printf 'Update recovery incomplete. Keep %s and retry apply or rollback after resolving the error.\n' "$STATE_DIR" >&2
+        code=1
+    elif (( TX_ACTIVE == 1 )); then
         printf 'Apply did not finish; restoring the saved state...\n' >&2
         if restore_snapshot; then
             archive_state || printf 'Original state restored; backup remains at %s\n' "$STATE_DIR" >&2
@@ -207,6 +267,9 @@ on_exit() {
 apply_tuning() {
     local current a b c desired
     current=$(read_value) || die "Cannot read a valid $KEY."
+    read -r a b c <<< "$current"
+    (( c >= TARGET_MAX )) || c=$TARGET_MAX
+    desired="$a $b $c"
     if [[ -e $STATE_DIR || -L $STATE_DIR ]]; then
         validate_state
         [[ $(<"$STATE_DIR/phase") == active ]] || die 'An incomplete operation exists. Run rollback first.'
@@ -214,13 +277,14 @@ apply_tuning() {
             die 'Managed file changed; refusing to overwrite it.'
         fi
         [[ $current == "$(<"$STATE_DIR/applied-value")" ]] || die 'Runtime value changed; inspect status before making changes.'
-        check_conflicts "$current"
+        check_conflicts "$desired"
+        if [[ $current != "$desired" ]]; then
+            upgrade_tuning "$current" "$desired"
+            return 0
+        fi
         info "Already applied: $KEY = $current (original backup preserved)."
         return 0
     fi
-    read -r a b c <<< "$current"
-    (( c >= TARGET_MAX )) || c=$TARGET_MAX
-    desired="$a $b $c"
     check_target_file
     check_conflicts "$desired"
     mkdir -p -- "${CONFIG_FILE%/*}" "${STATE_DIR%/*}"
@@ -277,6 +341,9 @@ show_status() {
     local current
     current=$(read_value) || die "Cannot read a valid $KEY."
     info "Current: $KEY = $current"
+    if [[ -e $STATE_DIR/update || -L $STATE_DIR/update ]]; then
+        die 'An interrupted update exists. Run apply or rollback to recover the previous applied state.'
+    fi
     if [[ -e $STATE_DIR || -L $STATE_DIR ]]; then
         validate_state
         info "Installation: $(<"$STATE_DIR/phase")"
@@ -293,13 +360,25 @@ show_status() {
 }
 
 usage() {
-    printf 'vps-tcp-tune %s\nUsage: sudo bash vps-tcp-tune.sh {apply|status|rollback|help}\n' "$VERSION"
+    printf 'vps-tcp-tune %s\nUsage: sudo bash vps-tcp-tune.sh apply [32|64]\n       sudo bash vps-tcp-tune.sh {status|rollback|help}\n' "$VERSION"
+    info 'apply defaults to 32 MiB; an existing larger maximum is always kept.'
 }
 
 main() {
-    (( $# <= 1 )) || die 'Expected one command. Use help.'
     local action=${1:-help}
-    case $action in help|--help|-h) usage; return 0 ;; apply|status|rollback) ;; *) die "Unknown command: $action" ;; esac
+    case $action in
+        apply)
+            (( $# <= 2 )) || die 'Usage: apply [32|64]'
+            case ${2-32} in
+                32) TARGET_MAX=33554432 ;;
+                64) TARGET_MAX=67108864 ;;
+                *) die 'Select 32 or 64 MiB. Example: apply 64' ;;
+            esac
+            ;;
+        help|--help|-h) (( $# <= 1 )) || die 'Unexpected arguments.'; usage; return 0 ;;
+        status|rollback) (( $# <= 1 )) || die 'Unexpected arguments.' ;;
+        *) die "Unknown command: $action" ;;
+    esac
     require_environment
     umask 077
     [[ ! -L $LOCK_FILE && ( ! -e $LOCK_FILE || -f $LOCK_FILE ) ]] || die "Unsafe lock path: $LOCK_FILE"
@@ -308,6 +387,9 @@ main() {
     trap on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    if [[ $action != status ]]; then
+        recover_update || die 'Interrupted update recovery failed; saved state was retained. Inspect current values and files.'
+    fi
     case $action in apply) apply_tuning ;; status) show_status ;; rollback) rollback_tuning ;; esac
 }
 

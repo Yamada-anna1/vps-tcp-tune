@@ -1,33 +1,50 @@
 # vps-tcp-tune
 
-给 Linux VPS 提供一个可检查、可回滚的 TCP 发送缓冲区调整工具。它将 `net.ipv4.tcp_wmem` 的第三项提高到 **32 MiB（33554432 字节）**，保留前两项，并保留已经更大的第三项。
+给 Linux VPS 提供一个可检查、可回滚的 TCP 发送缓冲区调整工具。支持将 `net.ipv4.tcp_wmem` 的第三项提高到 **32 MiB（33554432 字节）或 64 MiB（67108864 字节）**，保留前两项，并保留已经更大的第三项。不指定大小时默认选择 32 MiB。
 
 这个调整适合排查高延迟 TCP 连接的发送缓冲区限制。实际提速取决于连接是否受这一限制影响；它不保证跑满套餐带宽，也不保证达到 100 MB/s。
 
 ## 安装与应用
 
-在目标 VPS 的 **root 终端**执行以下命令，下载固定版本 `v1.0.0` 并应用：
+在目标 VPS 的 **root 终端**选择以下一条命令，下载固定版本 `v1.1.0` 并应用。
+
+### 32 MiB 安装命令
+
+将低于 32 MiB 的上限提高到 32 MiB；已有更大值会保留。
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/Yamada-anna1/vps-tcp-tune/v1.0.0/vps-tcp-tune.sh -o /root/vps-tcp-tune.sh && bash /root/vps-tcp-tune.sh apply
+curl -fL --retry 3 https://raw.githubusercontent.com/Yamada-anna1/vps-tcp-tune/v1.1.0/vps-tcp-tune.sh -o /root/vps-tcp-tune.sh && bash /root/vps-tcp-tune.sh apply 32
 ```
+
+### 64 MiB 安装命令
+
+将低于 64 MiB 的上限提高到 64 MiB；已有更大值会保留。也可直接用于已安装旧版或 32 MiB 方案的机器，首次安装前的备份会保留。
+
+```bash
+curl -fL --retry 3 https://raw.githubusercontent.com/Yamada-anna1/vps-tcp-tune/v1.1.0/vps-tcp-tune.sh -o /root/vps-tcp-tune.sh && bash /root/vps-tcp-tune.sh apply 64
+```
+
+**两个选项都只提高上限，不主动降低已有值。** 例如当前是 64 MiB，执行 `apply 32` 仍会保留 64 MiB；它不是强制降回 32 MiB 的命令。64 MiB 并不保证比 32 MiB 更快。
+
+### 依赖与检查
 
 需要 Linux、Bash 4 或更新版本、`sysctl`、`flock` 及常用系统命令；下载步骤需要 `curl`。脚本不会自动安装依赖。受限容器或不允许修改该 sysctl 的环境可能无法应用。
 
 希望先检查脚本时，可以分开执行：
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/Yamada-anna1/vps-tcp-tune/v1.0.0/vps-tcp-tune.sh -o /root/vps-tcp-tune.sh
+curl -fL --retry 3 https://raw.githubusercontent.com/Yamada-anna1/vps-tcp-tune/v1.1.0/vps-tcp-tune.sh -o /root/vps-tcp-tune.sh
 less /root/vps-tcp-tune.sh
-bash /root/vps-tcp-tune.sh apply
+bash /root/vps-tcp-tune.sh apply 32
 ```
 
-**已经将最大值设为 32 MiB 或更大的机器，通常无需再次安装。** 本工具首次备份的是安装时的真实状态；如果安装前已经是 32 MiB，回滚也会恢复到该状态，不会猜测历史值为 4 MiB。
+已经达到所选上限的机器不会再次提高该值。本工具首次备份的是安装时的真实状态；如果安装前已经是 64 MiB，回滚也会恢复到该状态，不会猜测历史值为 4 MiB。
 
 ## 命令
 
 ```bash
-bash /root/vps-tcp-tune.sh apply
+bash /root/vps-tcp-tune.sh apply 32
+bash /root/vps-tcp-tune.sh apply 64
 bash /root/vps-tcp-tune.sh status
 bash /root/vps-tcp-tune.sh rollback
 bash /root/vps-tcp-tune.sh help
@@ -35,7 +52,8 @@ bash /root/vps-tcp-tune.sh help
 
 | 命令 | 用途 |
 | --- | --- |
-| `apply` | 检查配置冲突、备份原状态、写入持久化配置并应用当前值 |
+| `apply` 或 `apply 32` | 选择 32 MiB 目标，检查配置冲突、备份原状态并应用 |
+| `apply 64` | 选择 64 MiB 目标；支持从已有 32 MiB 方案升级，保留首次备份 |
 | `status` | 查看当前参数及本工具的管理状态，不修改内核参数 |
 | `rollback` | 检查后续改动，恢复首次应用前的参数和目标配置文件 |
 | `help` | 显示用法 |
@@ -47,10 +65,11 @@ bash /root/vps-tcp-tune.sh help
 ```text
 新 min     = 当前 min
 新 default = 当前 default
-新 max     = max(当前 max, 33554432)
+所选目标    = 33554432（32 MiB）或 67108864（64 MiB）
+新 max     = max(当前 max, 所选目标)
 ```
 
-例如，当前最大值为 4 MiB 时提高到 32 MiB；已经为 64 MiB 时仍保留 64 MiB。最小值和默认值不变。
+例如，当前最大值为 4 MiB 时，根据选项提高到 32 或 64 MiB；当前已是 128 MiB 时，两种选项均保留 128 MiB。最小值和默认值不变。
 
 本工具管理以下位置：
 
@@ -60,6 +79,8 @@ bash /root/vps-tcp-tune.sh help
 | `/var/lib/vps-tcp-tune` | 首次原值、原文件备份及管理状态 |
 
 应用过程仅写入这一个内核参数，并回读确认结果，无需重启。重复运行 `apply` 不会用修改后的状态覆盖首次备份。脚本不调用 `sysctl --system` 来重放所有系统配置。
+
+从已管理的 32 MiB 升到 64 MiB 时，脚本先保存本次升级前的状态。升级失败会尝试恢复到此前工作的 32 MiB，首次安装前的备份继续保留。如果进程意外中断留下未完成升级，`status` 会提示；下次运行 `apply` 或 `rollback` 会先尝试恢复，再执行相应操作。检测到记录范围之外的手动修改时会停止。
 
 本工具不修改拥塞控制算法、队列、TCP 接收缓冲区、代理配置、防火墙或用户服务。已有 BBR 等设置保持原样。
 
@@ -92,6 +113,7 @@ bash /root/vps-tcp-tune.sh rollback
 回滚恢复的是**本工具首次应用前**的状态：
 
 - 恢复备份的完整三元组。
+- 先以 32 MiB 安装、再升级到 64 MiB，回滚仍恢复到第一次安装前的值。例如首次原值为 4 MiB，则回滚到 4 MiB。
 - 如果目标配置文件原来存在，恢复原文件；原来不存在，则移除本工具创建的文件。
 - 如果当前参数或受管文件出现无法与已记录状态对应的改动，拒绝直接覆盖，并提示检查差异。已经恢复为原状态的部分允许继续完成回滚。
 - 成功回滚后，将备份和状态归档到 `/var/lib` 下的相邻目录；具体路径以脚本输出为准。
@@ -100,11 +122,11 @@ bash /root/vps-tcp-tune.sh rollback
 
 ## 什么时候可能有效
 
-Linux 内核将 `tcp_wmem` 的第三项定义为 TCP 自动调优发送缓冲区的上限。应用显式设置 `SO_SNDBUF` 时，该连接的发送缓冲区自动调优会被关闭，本参数可能不再决定它的大小。参见 [Linux 内核 IP sysctl 文档中的 tcp_wmem](https://docs.kernel.org/networking/ip-sysctl.html#tcp-wmem)。
+Linux 内核将 `tcp_wmem` 的第三项定义为 TCP 自动调优发送缓冲区的上限。应用显式设置 `SO_SNDBUF` 时，该连接的发送缓冲区自动调优会被关闭，本参数可能不再决定它的大小。参见 [Linux 内核 IP sysctl 文档中的 tcp_wmem](https://docs.kernel.org/networking/ip-sysctl.html)。
 
 在真实传输期间，`ss -tin` 中持续增加的 `sndbuf_limited` 可以作为进一步检查发送缓冲区限制的线索。应结合该连接的 RTT、重传、接收窗口、CPU 和内存情况判断，并用相同源、相同方向和相同时长进行修改前后对照。
 
-32 MiB 是自动调优上限，不会在设置时立即为每个连接分配 32 MiB；多条活跃连接仍可能增加实际内存占用。小内存 VPS 应观察可用内存和内存压力，发现负面影响时回滚。
+32 或 64 MiB 是自动调优上限，不会在设置时立即为每个连接分配这么多内存；多条活跃连接仍可能增加实际内存占用。小内存 VPS 应观察可用内存和内存压力，发现负面影响时回滚。
 
 套餐限速、源站限速、跨网拥塞、本地网络、CPU 饱和或接收端限制，都可能继续限制速度。UDP/QUIC 数据传输不受这个 TCP 参数直接控制；经过 CDN 时，它只影响由这台 VPS 负责发送的 TCP 连接段。
 
@@ -121,10 +143,12 @@ Linux 内核将 `tcp_wmem` 的第三项定义为 TCP 自动调优发送缓冲区
 
 该测试中，原值下出现发送缓冲区限制，提高上限后相关限制消失。结果说明这条连接受益于调整，不能当作其他服务器的速度承诺，也不能用不同测试源之间的差异计算提速幅度。表中的 MB/s 按十进制字节计速；缓冲区大小的 MiB 按二进制计量。
 
+上述实测只比较 4 MiB 与 32 MiB；没有以此宣称 64 MiB 优于 32 MiB。64 MiB 选项及从旧版升级、失败恢复的行为通过隔离测试验证，是否有额外吞吐收益需要在实际线路上对照测试。
+
 其他 Linux 发行版只有满足依赖后的兼容性预期，未在这里宣称完成真实网络环境验证。自动化测试或 CI 通过，验证的是脚本行为，不代表已经验证某个发行版上的公网吞吐或重启行为。
 
 ## 官方资料
 
-- [Linux 内核：IP sysctl / tcp_wmem](https://docs.kernel.org/networking/ip-sysctl.html#tcp-wmem)
+- [Linux 内核：IP sysctl / tcp_wmem](https://docs.kernel.org/networking/ip-sysctl.html)
 - [systemd：sysctl.d 配置格式、目录优先级与文件顺序](https://www.freedesktop.org/software/systemd/man/latest/sysctl.d.html)
 - [systemd：systemd-sysctl 服务](https://www.freedesktop.org/software/systemd/man/latest/systemd-sysctl.service.html)

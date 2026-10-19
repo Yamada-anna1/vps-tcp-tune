@@ -17,5 +17,7 @@ jobs:
           bash -n tests/test.sh
       - name: Check shell safety
         run: shellcheck -x vps-tcp-tune.sh tests/test.sh
+      - name: Verify script checksum
+        run: sha256sum --check SHA256SUMS
       - name: Test isolated state and failure recovery
         run: bash tests/test.sh

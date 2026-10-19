@@ -10,7 +10,7 @@ SCRIPT=$(cd -- "$TEST_DIR/.." && pwd)/vps-tcp-tune.sh
 # disable errexit inside functions and give misleading transaction test results.
 if [[ ${1:-} == __run ]]; then
     fixture=$2
-    action=$3
+    shift 2
     # shellcheck source=../vps-tcp-tune.sh
     source "$SCRIPT"
     CONFIG_FILE=$fixture/etc/sysctl.d/99-vps-tcp-throughput.conf
@@ -55,6 +55,15 @@ if [[ ${1:-} == __run ]]; then
             rm -- "$fixture/fail-install-once"
             return 24
         fi
+        if [[ $destination == "$STATE_DIR/managed.conf" && -e $fixture/fail-update-metadata-once ]]; then
+            rm -- "$fixture/fail-update-metadata-once"
+            return 26
+        fi
+        if [[ $destination == "$STATE_DIR/applied-value" && -e $fixture/crash-update-once ]]; then
+            command mv "$@"
+            rm -- "$fixture/crash-update-once"
+            kill -KILL "$$"
+        fi
         command mv "$@"
     }
     cp() {
@@ -66,7 +75,7 @@ if [[ ${1:-} == __run ]]; then
         fi
         command cp "$@"
     }
-    main "$action"
+    main "$@"
     exit
 fi
 
@@ -111,18 +120,18 @@ new_case() {
 
 run_command() {
     set +e
-    bash "$TEST_DIR/test.sh" __run "$CASE" "$1" > "$CASE/command.log" 2>&1
+    bash "$TEST_DIR/test.sh" __run "$CASE" "$@" > "$CASE/command.log" 2>&1
     RESULT=$?
     set -e
 }
 
 run_ok() {
-    run_command "$1"
+    run_command "$@"
     (( RESULT == 0 )) || fail "$1 exited $RESULT"
 }
 
 run_fail() {
-    run_command "$1"
+    run_command "$@"
     (( RESULT != 0 )) || fail "$1 unexpectedly succeeded"
 }
 
@@ -444,6 +453,167 @@ test_prepared_untouched_state_is_recoverable() {
     assert_archived
 }
 
+test_explicit_32_profile() {
+    new_case profile32 '4096 65536 4194304'
+    run_ok apply 32
+    assert_eq "$(<"$CASE/runtime")" '4096 65536 33554432'
+}
+
+test_fresh_64_profile_and_rollback() {
+    new_case profile64 '4096 65536 4194304'
+    run_ok apply 64
+    assert_eq "$(<"$CASE/runtime")" '4096 65536 67108864'
+    assert_contains "$CONFIG" 'net.ipv4.tcp_wmem = 4096 65536 67108864'
+    run_ok apply 64
+    assert_eq "$(wc -l < "$CASE/writes" | tr -d '[:space:]')" 1
+    run_ok rollback
+    assert_eq "$(<"$CASE/runtime")" '4096 65536 4194304'
+    assert_absent "$CONFIG"
+}
+
+test_64_profile_keeps_existing_128m() {
+    new_case keep128 '4096 65536 134217728'
+    run_ok apply 64
+    assert_eq "$(<"$CASE/runtime")" '4096 65536 134217728'
+    assert_eq "$(<"$CASE/writes")" ''
+}
+
+test_upgrade_preserves_first_backup_and_file() {
+    new_case upgrade '4096 65536 4194304'
+    printf '# Original before any install\nnet.ipv4.tcp_wmem = 4096 65536 4194304\n' > "$CONFIG"
+    cp -p -- "$CONFIG" "$CASE/original.expected"
+    run_ok apply 32
+    run_ok apply 64
+    assert_eq "$(<"$CASE/runtime")" '4096 65536 67108864'
+    assert_eq "$(<"$STATE/applied-value")" '4096 65536 67108864'
+    assert_eq "$(<"$STATE/original-value")" '4096 65536 4194304'
+    assert_same "$STATE/original.conf" "$CASE/original.expected"
+    assert_same "$CONFIG" "$STATE/managed.conf"
+    assert_absent "$STATE/update"
+    run_ok apply 32
+    assert_eq "$(<"$CASE/runtime")" '4096 65536 67108864'
+    run_ok apply 64
+    assert_eq "$(wc -l < "$CASE/writes" | tr -d '[:space:]')" 2
+    run_ok rollback
+    assert_eq "$(<"$CASE/runtime")" '4096 65536 4194304'
+    assert_same "$CONFIG" "$CASE/original.expected"
+    assert_archived
+}
+
+test_upgrade_from_v1_0_state() {
+    new_case legacy '4096 16384 33554432'
+    mkdir -- "$STATE"
+    printf '4096 16384 4194304\n' > "$STATE/original-value"
+    printf '4096 16384 33554432\n' > "$STATE/applied-value"
+    printf 'absent\n' > "$STATE/original-file"
+    printf 'active\n' > "$STATE/phase"
+    printf '# Managed by vps-tcp-tune 1.0.0; use the rollback command to restore.\nnet.ipv4.tcp_wmem = 4096 16384 33554432\n' > "$STATE/managed.conf"
+    cp -- "$STATE/managed.conf" "$CONFIG"
+    run_ok apply 64
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 67108864'
+    assert_eq "$(<"$STATE/original-value")" '4096 16384 4194304'
+    run_ok rollback
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 4194304'
+    assert_absent "$CONFIG"
+}
+
+test_upgrade_failures_restore_previous_working_profile() {
+    local marker
+    for marker in fail-write-once fail-readback-once fail-install-once fail-backup-once fail-update-metadata-once; do
+        new_case "upgrade_$marker"
+        run_ok apply 32
+        cp -- "$CONFIG" "$CASE/previous.expected"
+        : > "$CASE/$marker"
+        run_fail apply 64
+        assert_eq "$(<"$CASE/runtime")" '4096 16384 33554432'
+        assert_eq "$(<"$STATE/applied-value")" '4096 16384 33554432'
+        assert_eq "$(<"$STATE/original-value")" '4096 16384 4194304'
+        assert_same "$CONFIG" "$CASE/previous.expected"
+        assert_same "$CONFIG" "$STATE/managed.conf"
+        assert_absent "$STATE/update"
+        run_ok status
+        run_ok apply 64
+        assert_eq "$(<"$CASE/runtime")" '4096 16384 67108864'
+        run_ok rollback
+        assert_eq "$(<"$CASE/runtime")" '4096 16384 4194304'
+        assert_absent "$CONFIG"
+    done
+}
+
+test_interrupted_upgrade_recovers_without_losing_first_backup() {
+    new_case interrupted_upgrade
+    run_ok apply 32
+    : > "$CASE/crash-update-once"
+    run_fail apply 64
+    assert_file "$STATE/update/original-value"
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 67108864'
+    run_fail status
+    assert_contains "$CASE/command.log" 'interrupted update'
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 67108864'
+    run_ok apply 32
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 33554432'
+    assert_eq "$(<"$STATE/original-value")" '4096 16384 4194304'
+    assert_absent "$STATE/update"
+    run_ok apply 64
+    run_ok rollback
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 4194304'
+}
+
+test_interrupted_upgrade_rollback_and_modification_guard() {
+    new_case interrupted_changed
+    run_ok apply 32
+    : > "$CASE/crash-update-once"
+    run_fail apply 64
+    printf '4096 16384 134217728\n' > "$CASE/runtime"
+    run_fail apply 64
+    run_fail rollback
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 134217728'
+    assert_file "$STATE/update/original-value"
+    printf '4096 16384 67108864\n' > "$CASE/runtime"
+    run_ok rollback
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 4194304'
+    assert_absent "$CONFIG"
+}
+
+test_upgrade_conflict_keeps_previous_state() {
+    new_case upgrade_conflict
+    run_ok apply 32
+    printf 'net.ipv4.tcp_wmem = 4096 16384 33554432\n' > "$CASE/etc/sysctl.d/10-other.conf"
+    run_fail apply 64
+    assert_contains "$CASE/command.log" 'Conflict:'
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 33554432'
+    assert_eq "$(<"$STATE/applied-value")" '4096 16384 33554432'
+    assert_absent "$STATE/update"
+}
+
+test_upgrade_respects_administrator_changes() {
+    new_case upgrade_admin
+    run_ok apply 32
+    cp -- "$CONFIG" "$CASE/previous.expected"
+    printf '# Administrator edit\n' >> "$CONFIG"
+    run_fail apply 64
+    assert_contains "$CONFIG" 'Administrator edit'
+    cp -- "$CASE/previous.expected" "$CONFIG"
+    printf '4096 16384 134217728\n' > "$CASE/runtime"
+    run_fail apply 64
+    assert_eq "$(<"$CASE/runtime")" '4096 16384 134217728'
+    assert_absent "$STATE/update"
+}
+
+test_invalid_profiles_do_not_modify_state() {
+    local profile
+    new_case bad_arguments
+    for profile in '' 0 16 128 64MiB; do
+        run_fail apply "$profile"
+    done
+    run_fail apply 32 64
+    run_fail status 64
+    run_fail rollback 64
+    assert_absent "$STATE"
+    assert_absent "$CONFIG"
+    assert_eq "$(<"$CASE/writes")" ''
+}
+
 tests=(
     test_raise_4m_preserves_first_values
     test_existing_32m_has_no_sysctl_write
@@ -470,6 +640,17 @@ tests=(
     test_native_flock_prevents_concurrent_apply
     test_prepared_transaction_is_recoverable
     test_prepared_untouched_state_is_recoverable
+    test_explicit_32_profile
+    test_fresh_64_profile_and_rollback
+    test_64_profile_keeps_existing_128m
+    test_upgrade_preserves_first_backup_and_file
+    test_upgrade_from_v1_0_state
+    test_upgrade_failures_restore_previous_working_profile
+    test_interrupted_upgrade_recovers_without_losing_first_backup
+    test_interrupted_upgrade_rollback_and_modification_guard
+    test_upgrade_conflict_keeps_previous_state
+    test_upgrade_respects_administrator_changes
+    test_invalid_profiles_do_not_modify_state
 )
 
 for test_function in "${tests[@]}"; do
