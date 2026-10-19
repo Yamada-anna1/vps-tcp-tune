@@ -1,0 +1,21 @@
+name: Shell tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check syntax
+        run: |
+          bash -n vps-tcp-tune.sh
+          bash -n tests/test.sh
+      - name: Check shell safety
+        run: shellcheck -x vps-tcp-tune.sh tests/test.sh
+      - name: Test isolated state and failure recovery
+        run: bash tests/test.sh
